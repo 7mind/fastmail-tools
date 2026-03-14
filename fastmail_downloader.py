@@ -990,23 +990,19 @@ def merge_pdfs(
             blob = pdf_blobs.get(att.blob_id)
             if not blob:
                 continue
+            # Intercept pypdf warnings to add attachment context
+            pypdf_logger = logging.getLogger("pypdf")
+            class _ContextFilter(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    record.msg = (
+                        f"[attachment '{att.name}' from '{email.subject}']: "
+                        f"{record.msg}"
+                    )
+                    return True
+            ctx_filter = _ContextFilter()
+            pypdf_logger.addFilter(ctx_filter)
             try:
-                # Intercept pypdf warnings to add attachment context
-                pypdf_logger = logging.getLogger("pypdf")
-                old_level = pypdf_logger.level
-                class _ContextFilter(logging.Filter):
-                    def filter(self, record: logging.LogRecord) -> bool:
-                        record.msg = (
-                            f"[attachment '{att.name}' from '{email.subject}']: "
-                            f"{record.msg}"
-                        )
-                        return True
-                ctx_filter = _ContextFilter()
-                pypdf_logger.addFilter(ctx_filter)
-                try:
-                    att_reader = PdfReader(io.BytesIO(blob))
-                finally:
-                    pypdf_logger.removeFilter(ctx_filter)
+                att_reader = PdfReader(io.BytesIO(blob))
                 for page in att_reader.pages:
                     box = page.mediabox
                     src_w = float(box.width)
@@ -1031,6 +1027,8 @@ def merge_pdfs(
             except Exception as exc:
                 click.echo(f"  Warning: could not read PDF attachment '{att.name}' "
                            f"from email '{email.subject}': {exc}", err=True)
+            finally:
+                pypdf_logger.removeFilter(ctx_filter)
 
     output = io.BytesIO()
     writer.write(output)
@@ -1349,7 +1347,7 @@ def main(
         parsed_quote_limit: Optional[int] = None
     else:
         parsed_quote_limit = int(quote_limit)
-        assert parsed_quote_limit > 0, "--quote-limit must be a positive integer or 'none'"
+        assert parsed_quote_limit >= 0, "--quote-limit must be a non-negative integer or 'none'"
 
     assert single_file or file_per_chain, (
         "Specify at least one output mode: --single-file or --file-per-chain"

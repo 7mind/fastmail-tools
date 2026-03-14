@@ -24,6 +24,7 @@
             pythonPkgs.jinja2
             pythonPkgs.python-dateutil
             pythonPkgs.pypdf
+            pythonPkgs.cryptography
           ];
         };
       });

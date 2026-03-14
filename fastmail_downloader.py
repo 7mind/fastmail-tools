@@ -68,8 +68,41 @@ def jmap_call(session: JmapSession, method_calls: list[list]) -> list:
     return response.json()["methodResponses"]
 
 
+CACHE_DIR = ".cache"
+
+
+def _cache_path(blob_id: str) -> str:
+    """Return the filesystem path for a cached blob."""
+    return os.path.join(CACHE_DIR, blob_id)
+
+
+def _cache_read(blob_id: str) -> Optional[bytes]:
+    """Read a blob from cache. Returns None on miss."""
+    path = _cache_path(blob_id)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return None
+
+
+def _cache_write(blob_id: str, data: bytes) -> None:
+    """Write a blob to cache."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = _cache_path(blob_id)
+    with open(path, "wb") as f:
+        f.write(data)
+
+
 def download_blob(session: JmapSession, blob_id: str, name: str) -> bytes:
-    """Download a blob (attachment) from Fastmail."""
+    """Download a blob from Fastmail, using local cache keyed by blobId.
+
+    JMAP blobIds are immutable and content-addressed (RFC 8620/8621),
+    so a cached blob is guaranteed to be correct.
+    """
+    cached = _cache_read(blob_id)
+    if cached is not None:
+        return cached
+
     url = session.download_url.replace(
         "{accountId}", session.account_id
     ).replace(
@@ -81,7 +114,10 @@ def download_blob(session: JmapSession, blob_id: str, name: str) -> bytes:
     )
     response = requests.get(url, headers=session.headers)
     response.raise_for_status()
-    return response.content
+    data = response.content
+
+    _cache_write(blob_id, data)
+    return data
 
 
 # --- Email Data Model ---
@@ -235,7 +271,39 @@ def parse_email(raw: dict, body_values: dict) -> Email:
 
 # --- JMAP Email Querying ---
 
+EXCLUDED_MAILBOX_ROLES = {"trash", "drafts", "scheduled", "outbox"}
+
 QUERY_BATCH_SIZE = 50
+
+
+def get_excluded_mailbox_ids(session: JmapSession) -> list[str]:
+    """Find mailbox IDs for Trash, Drafts, Scheduled, and Outbox."""
+    responses = jmap_call(session, [
+        [
+            "Mailbox/get",
+            {
+                "accountId": session.account_id,
+                "properties": ["id", "role", "name"],
+            },
+            "m0",
+        ]
+    ])
+
+    result = responses[0]
+    assert result[0] == "Mailbox/get", f"Unexpected response: {result[0]}"
+
+    excluded_ids = []
+    for mailbox in result[1]["list"]:
+        role = mailbox.get("role")
+        name = (mailbox.get("name") or "").lower()
+        if role in EXCLUDED_MAILBOX_ROLES:
+            excluded_ids.append(mailbox["id"])
+            click.echo(f"  Excluding mailbox: {mailbox.get('name')} (role={role})")
+        elif name in ("scheduled", "outbox", "scheduled messages"):
+            excluded_ids.append(mailbox["id"])
+            click.echo(f"  Excluding mailbox: {mailbox.get('name')} (name match)")
+
+    return excluded_ids
 
 
 def build_address_filter(
@@ -273,6 +341,7 @@ def build_filter(
     from_list: list[str],
     to_list: list[str],
     cc_list: list[str],
+    excluded_mailbox_ids: Optional[list[str]] = None,
 ) -> dict:
     parts = []
 
@@ -284,6 +353,12 @@ def build_filter(
     address_filter = build_address_filter(from_list, to_list, cc_list)
     if address_filter:
         parts.append(address_filter)
+
+    if excluded_mailbox_ids:
+        parts.append({"inMailboxOtherThan": excluded_mailbox_ids})
+
+    # Exclude drafts by keyword (catches drafts even if not in a Drafts mailbox)
+    parts.append({"notKeyword": "$draft"})
 
     assert len(parts) > 0, "At least one filter criterion is required"
 
@@ -1275,8 +1350,11 @@ def main(
     session = create_session(token)
     click.echo(f"Connected. Account: {session.account_id}")
 
+    click.echo("Finding mailboxes to exclude...")
+    excluded_mailbox_ids = get_excluded_mailbox_ids(session)
+
     click.echo("Building query filter...")
-    email_filter = build_filter(range_start, range_end, from_substrings, to_substrings, cc_substrings)
+    email_filter = build_filter(range_start, range_end, from_substrings, to_substrings, cc_substrings, excluded_mailbox_ids)
     click.echo(f"Filter: {json.dumps(email_filter, indent=2)}")
 
     click.echo("Querying emails...")

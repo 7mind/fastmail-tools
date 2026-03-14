@@ -1,5 +1,6 @@
 test.sh
 output/
+.cache/
 
 # Python
 __pycache__/

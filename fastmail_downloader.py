@@ -111,7 +111,9 @@ class Attachment:
 @dataclass
 class Email:
     id: str
+    blob_id: str
     thread_id: str
+    message_id: str
     subject: str
     sent_at: datetime
     received_at: datetime
@@ -188,9 +190,14 @@ def parse_email(raw: dict, body_values: dict) -> Email:
     sent_at = isoparse(sent_at_str) if sent_at_str else isoparse(received_at_str)
     received_at = isoparse(received_at_str)
 
+    message_id_list = raw.get("messageId") or []
+    message_id = message_id_list[0] if message_id_list else raw["id"]
+
     return Email(
         id=raw["id"],
+        blob_id=raw["blobId"],
         thread_id=raw["threadId"],
+        message_id=message_id,
         subject=raw.get("subject", "(no subject)"),
         sent_at=sent_at,
         received_at=received_at,
@@ -312,7 +319,7 @@ def _fetch_email_batch(session: JmapSession, batch: list[str]) -> list[Email]:
                 "accountId": session.account_id,
                 "ids": batch,
                 "properties": [
-                    "id", "threadId", "subject", "sentAt", "receivedAt",
+                    "id", "blobId", "threadId", "messageId", "subject", "sentAt", "receivedAt",
                     "from", "to", "cc", "bcc", "preview",
                     "textBody", "htmlBody", "bodyValues",
                     "attachments",
@@ -409,6 +416,40 @@ def download_pdf_attachments(
     return pdf_blobs
 
 
+def save_source_emails(session: JmapSession, emails: list[Email], output_dir: str) -> None:
+    """Download and save raw .eml files for all emails into output_dir/source/."""
+    source_dir = os.path.join(output_dir, SOURCE_SUBDIR)
+    os.makedirs(source_dir, exist_ok=True)
+
+    _validate_dir_contents(source_dir, {".eml"}, set())
+    removed = _clean_dir(source_dir)
+    if removed:
+        click.echo(f"Cleaned {removed} existing .eml file(s) from {source_dir}")
+
+    total = len(emails)
+    click.echo(f"Saving {total} source email(s)...")
+
+    lock = threading.Lock()
+    saved_count = 0
+
+    def download_and_save(email: Email) -> None:
+        nonlocal saved_count
+        raw = download_blob(session, email.blob_id, f"{email.id}.eml")
+        date_prefix = email.sent_at.strftime("%Y%m%d_%H%M%S")
+        filename = f"{date_prefix}_{sanitize_filename(email.subject)}.eml"
+        filepath = os.path.join(source_dir, filename)
+        with open(filepath, "wb") as f:
+            f.write(raw)
+        with lock:
+            saved_count += 1
+            click.echo(f"  Saved {saved_count}/{total}: {filename}")
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [pool.submit(download_and_save, e) for e in emails]
+        for future in as_completed(futures):
+            future.result()
+
+
 # --- PDF Rendering ---
 
 EMAIL_HTML_TEMPLATE = """\
@@ -420,6 +461,8 @@ EMAIL_HTML_TEMPLATE = """\
     {cc_line}
     {bcc_line}
     <div class="email-field"><span class="label">Subject:</span> {subject}</div>
+    <div class="email-field"><span class="label">Message-ID:</span> <span class="id-value">{message_id}</span></div>
+    <div class="email-field"><span class="label">Thread-ID:</span> <span class="id-value">{thread_id}</span></div>
     {attachments_line}
   </div>
   <div class="email-body">
@@ -491,10 +534,32 @@ PAGE_HTML_TEMPLATE = """\
   .email-body table {{
     max-width: 100%;
   }}
+  .id-value {{
+    font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
+    font-size: 8pt;
+    color: #777;
+  }}
   .text-body {{
     white-space: pre-wrap;
     font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;
     font-size: 10pt;
+  }}
+  .email-body blockquote {{
+    margin: 0.3em 0 0.3em 0;
+    padding: 0.2em 0 0.2em 0.8em;
+    border-left: 3px solid #ccc;
+  }}
+  .email-body blockquote blockquote {{
+    border-left-color: #aaa;
+  }}
+  .email-body blockquote blockquote blockquote {{
+    border-left-color: #888;
+  }}
+  .quote-clipped {{
+    color: #999;
+    font-style: italic;
+    font-size: 9pt;
+    padding: 0.2em 0;
   }}
   h1 {{
     font-size: 16pt;
@@ -544,7 +609,108 @@ def format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
 
 
-def render_email_html(email: Email) -> str:
+DEFAULT_QUOTE_LIMIT = 3
+CLIPPED_NOTICE = '<div class="quote-clipped">[nested quoted text clipped]</div>'
+
+
+def text_to_quoted_html(text: str, max_depth: Optional[int] = DEFAULT_QUOTE_LIMIT) -> str:
+    """Convert plain text with > quoting into nested blockquote HTML."""
+    lines = text.split("\n")
+    result: list[str] = []
+    current_depth = 0
+    clipped = False
+
+    for line in lines:
+        # Count leading > characters
+        depth = 0
+        rest = line
+        while rest.startswith(">"):
+            depth += 1
+            rest = rest[1:]
+            if rest.startswith(" "):
+                rest = rest[1:]
+
+        if max_depth is not None and depth > max_depth:
+            if not clipped:
+                # Close down to max_depth, insert notice
+                while current_depth > max_depth:
+                    result.append("</blockquote>")
+                    current_depth -= 1
+                while current_depth < max_depth:
+                    result.append("<blockquote>")
+                    current_depth += 1
+                result.append(CLIPPED_NOTICE)
+                clipped = True
+            continue
+
+        clipped = False
+
+        # Adjust nesting
+        while current_depth < depth:
+            result.append("<blockquote>")
+            current_depth += 1
+        while current_depth > depth:
+            result.append("</blockquote>")
+            current_depth -= 1
+
+        result.append(escape_html(rest))
+        result.append("<br>")
+
+    # Close remaining open blockquotes
+    while current_depth > 0:
+        result.append("</blockquote>")
+        current_depth -= 1
+
+    return "".join(result)
+
+
+def clip_deep_blockquotes(html: str, max_depth: Optional[int] = DEFAULT_QUOTE_LIMIT) -> str:
+    """Replace blockquote content nested deeper than max_depth with a clipped notice."""
+    if max_depth is None:
+        return html
+    depth = 0
+    result: list[str] = []
+    i = 0
+    clipped_at_depth: Optional[int] = None
+
+    while i < len(html):
+        # Check for opening <blockquote
+        open_match = re.match(r"<\s*blockquote[\s>]", html[i:], re.IGNORECASE)
+        close_match = re.match(r"<\s*/\s*blockquote\s*>", html[i:], re.IGNORECASE)
+
+        if open_match:
+            depth += 1
+            tag_end = html.index(">", i) + 1
+            if depth > max_depth:
+                if clipped_at_depth is None:
+                    clipped_at_depth = depth
+                    result.append(CLIPPED_NOTICE)
+                i = tag_end
+                continue
+            result.append(html[i:tag_end])
+            i = tag_end
+        elif close_match:
+            tag_end = html.index(">", i) + 1
+            if clipped_at_depth is not None:
+                if depth <= clipped_at_depth:
+                    clipped_at_depth = None
+                    if depth <= max_depth:
+                        result.append(html[i:tag_end])
+                i = tag_end
+            else:
+                result.append(html[i:tag_end])
+                i = tag_end
+            depth -= 1
+        elif clipped_at_depth is not None:
+            i += 1
+        else:
+            result.append(html[i])
+            i += 1
+
+    return "".join(result)
+
+
+def render_email_html(email: Email, quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> str:
     cc_line = ""
     if email.cc_addresses:
         cc_line = f'<div class="email-field"><span class="label">Cc:</span> {escape_html(email.cc_str)}</div>'
@@ -566,9 +732,9 @@ def render_email_html(email: Email) -> str:
         )
 
     if email.html_body.strip():
-        body = sanitize_html_body(email.html_body)
+        body = clip_deep_blockquotes(sanitize_html_body(email.html_body), quote_limit)
     elif email.text_body.strip():
-        body = f'<div class="text-body">{escape_html(email.text_body)}</div>'
+        body = f'<div class="text-body">{text_to_quoted_html(email.text_body, quote_limit)}</div>'
     else:
         body = f'<div class="text-body">{escape_html(email.preview)}</div>'
 
@@ -579,6 +745,8 @@ def render_email_html(email: Email) -> str:
         cc_line=cc_line,
         bcc_line=bcc_line,
         subject=escape_html(email.subject),
+        message_id=escape_html(email.message_id),
+        thread_id=escape_html(email.thread_id),
         attachments_line=attachments_line,
         body=body,
     )
@@ -591,11 +759,11 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
-def render_emails_to_pdf_bytes(emails_sorted: list[Email], title: str) -> bytes:
+def render_emails_to_pdf_bytes(emails_sorted: list[Email], title: str, quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> bytes:
     """Render a list of emails to PDF bytes (without attachment merging)."""
     from weasyprint import HTML
 
-    content = "\n".join(render_email_html(e) for e in emails_sorted)
+    content = "\n".join(render_email_html(e, quote_limit) for e in emails_sorted)
     full_html = PAGE_HTML_TEMPLATE.format(title=escape_html(title), content=content)
     return HTML(string=full_html).write_pdf()
 
@@ -728,8 +896,9 @@ def apply_overlays(
     pdf_bytes: bytes,
     page_metas: list[PageMeta],
     thread_title: str,
+    thread_id: str,
 ) -> bytes:
-    """Apply footer (page numbers + thread name) and header (attachment info) overlays."""
+    """Apply footer (page numbers + thread name + thread ID) and header (attachment info) overlays."""
     from pypdf import PdfReader, PdfWriter
     from weasyprint import HTML
 
@@ -738,7 +907,9 @@ def apply_overlays(
     overlay_pages_html = []
     for i, meta in enumerate(page_metas):
         page_num = i + 1
-        footer = escape_html(f'Thread \u201c{thread_title}\u201d, page {page_num}/{total_pages}')
+        footer = escape_html(
+            f'Thread \u201c{thread_title}\u201d [{thread_id}], page {page_num}/{total_pages}'
+        )
 
         header = ""
         if meta.attachment:
@@ -773,13 +944,13 @@ def apply_overlays(
     return output.getvalue()
 
 
-def render_single_pdf(emails: list[Email], output_path: str, pdf_blobs: dict[str, bytes]) -> None:
+def render_single_pdf(emails: list[Email], output_path: str, pdf_blobs: dict[str, bytes], quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> None:
     emails_sorted = sorted(emails, key=lambda e: e.sent_at)
     title = f"Email Archive \u2014 {len(emails)} messages"
 
-    base_pdf = render_emails_to_pdf_bytes(emails_sorted, title)
+    base_pdf = render_emails_to_pdf_bytes(emails_sorted, title, quote_limit)
     merged_pdf, page_metas = merge_pdfs(base_pdf, emails_sorted, pdf_blobs)
-    final_pdf = apply_overlays(merged_pdf, page_metas, title)
+    final_pdf = apply_overlays(merged_pdf, page_metas, title, "archive")
 
     with open(output_path, "wb") as f:
         f.write(final_pdf)
@@ -793,15 +964,16 @@ def _render_one_thread(
     thread_emails: list[Email],
     pdf_blobs: dict[str, bytes],
     output_dir: str,
+    quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
 ) -> str:
     """Render a single thread to a PDF file. Returns the output filepath."""
     thread_emails.sort(key=lambda e: e.sent_at)
     first = thread_emails[0]
 
     title = f"Thread: {first.subject} ({len(thread_emails)} messages)"
-    base_pdf = render_emails_to_pdf_bytes(thread_emails, title)
+    base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit)
     merged_pdf, page_metas = merge_pdfs(base_pdf, thread_emails, pdf_blobs)
-    final_pdf = apply_overlays(merged_pdf, page_metas, first.subject)
+    final_pdf = apply_overlays(merged_pdf, page_metas, first.subject, first.thread_id)
 
     date_prefix = first.sent_at.strftime("%Y%m%d")
     filename = f"{date_prefix}_{sanitize_filename(first.subject)}.pdf"
@@ -812,32 +984,54 @@ def _render_one_thread(
     return filepath
 
 
-def prepare_output_dir(output_dir: str) -> None:
-    """Create output dir if needed, validate contents, and clean existing PDFs."""
-    os.makedirs(output_dir, exist_ok=True)
+SOURCE_SUBDIR = "source"
 
-    for entry in os.scandir(output_dir):
+
+def _validate_dir_contents(dir_path: str, allowed_extensions: set[str], allowed_subdirs: set[str]) -> None:
+    """Validate that a directory contains only files with allowed extensions and allowed subdirs."""
+    if not os.path.exists(dir_path):
+        return
+    for entry in os.scandir(dir_path):
         if entry.is_dir(follow_symlinks=False):
+            if entry.name not in allowed_subdirs:
+                raise click.ClickException(
+                    f"Directory '{dir_path}' contains unexpected subdirectory '{entry.name}'. "
+                    f"Allowed subdirectories: {allowed_subdirs}. Refusing to proceed."
+                )
+        elif not any(entry.name.lower().endswith(ext) for ext in allowed_extensions):
             raise click.ClickException(
-                f"Output directory '{output_dir}' contains subdirectory '{entry.name}'. "
-                f"Refusing to proceed — directory must only contain .pdf files."
-            )
-        if not entry.name.lower().endswith(".pdf"):
-            raise click.ClickException(
-                f"Output directory '{output_dir}' contains non-PDF file '{entry.name}'. "
-                f"Refusing to proceed — directory must only contain .pdf files."
+                f"Directory '{dir_path}' contains unexpected file '{entry.name}'. "
+                f"Allowed extensions: {allowed_extensions}. Refusing to proceed."
             )
 
-    # Clean existing PDFs
+
+def _clean_dir(dir_path: str) -> int:
+    """Remove all files in a directory (not subdirs). Returns count removed."""
+    if not os.path.exists(dir_path):
+        return 0
     removed = 0
-    for entry in os.scandir(output_dir):
-        os.remove(entry.path)
-        removed += 1
+    for entry in os.scandir(dir_path):
+        if entry.is_file():
+            os.remove(entry.path)
+            removed += 1
+    return removed
+
+
+def prepare_output_dir(output_dir: str) -> None:
+    """Create output dir structure, validate contents, and clean existing files."""
+    os.makedirs(output_dir, exist_ok=True)
+    source_dir = os.path.join(output_dir, SOURCE_SUBDIR)
+    os.makedirs(source_dir, exist_ok=True)
+
+    _validate_dir_contents(output_dir, {".pdf"}, {SOURCE_SUBDIR})
+    _validate_dir_contents(source_dir, {".eml"}, set())
+
+    removed = _clean_dir(output_dir) + _clean_dir(source_dir)
     if removed:
-        click.echo(f"Cleaned {removed} existing PDF(s) from {output_dir}")
+        click.echo(f"Cleaned {removed} existing file(s) from {output_dir}")
 
 
-def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict[str, bytes]) -> None:
+def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict[str, bytes], quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> None:
     prepare_output_dir(output_dir)
 
     threads: dict[str, list[Email]] = {}
@@ -850,7 +1044,7 @@ def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict
 
     def render_and_report(thread_emails: list[Email]) -> str:
         nonlocal rendered_count
-        filepath = _render_one_thread(thread_emails, pdf_blobs, output_dir)
+        filepath = _render_one_thread(thread_emails, pdf_blobs, output_dir, quote_limit)
         with lock:
             rendered_count += 1
             click.echo(f"  Written ({rendered_count}/{total}): {filepath}")
@@ -920,6 +1114,11 @@ def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict
     default="output",
     help="Output file path (for --single-file) or directory (for --file-per-chain).",
 )
+@click.option(
+    "--quote-limit",
+    default="3",
+    help="Max blockquote nesting depth to render. 'none' for unlimited. Default: 3.",
+)
 def main(
     token: str,
     range_start: Optional[datetime],
@@ -930,8 +1129,15 @@ def main(
     single_file: bool,
     file_per_chain: bool,
     output: str,
+    quote_limit: str,
 ) -> None:
     """Download emails from Fastmail and export them as PDF."""
+
+    if quote_limit.lower() == "none":
+        parsed_quote_limit: Optional[int] = None
+    else:
+        parsed_quote_limit = int(quote_limit)
+        assert parsed_quote_limit > 0, "--quote-limit must be a positive integer or 'none'"
 
     assert single_file or file_per_chain, (
         "Specify at least one output mode: --single-file or --file-per-chain"
@@ -979,9 +1185,13 @@ def main(
     if single_file:
         if not output.endswith(".pdf"):
             output = output + ".pdf"
-        render_single_pdf(emails, output, pdf_blobs)
+        render_single_pdf(emails, output, pdf_blobs, parsed_quote_limit)
+        source_base = os.path.dirname(os.path.abspath(output))
     else:
-        render_per_thread_pdfs(emails, output, pdf_blobs)
+        render_per_thread_pdfs(emails, output, pdf_blobs, parsed_quote_limit)
+        source_base = output
+
+    save_source_emails(session, emails, source_base)
 
     click.echo("Done.")
 

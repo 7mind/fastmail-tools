@@ -6,6 +6,7 @@ and renders them to PDF — either as a single chronological file or one file pe
 PDF attachments are downloaded and appended to the rendered output.
 """
 
+import base64
 import io
 import json
 import os
@@ -102,10 +103,20 @@ class Attachment:
     media_type: str
     size: int
     blob_id: str
+    cid: Optional[str]
+    disposition: Optional[str]
 
     @property
     def is_pdf(self) -> bool:
         return self.media_type == "application/pdf"
+
+    @property
+    def is_inline(self) -> bool:
+        return self.cid is not None and self.disposition == "inline"
+
+    @property
+    def is_image(self) -> bool:
+        return self.media_type.startswith("image/")
 
 
 @dataclass
@@ -143,8 +154,16 @@ class Email:
         return ", ".join(str(a) for a in self.bcc_addresses)
 
     @property
+    def inline_attachments(self) -> list[Attachment]:
+        return [a for a in self.attachments if a.is_inline]
+
+    @property
+    def non_inline_attachments(self) -> list[Attachment]:
+        return [a for a in self.attachments if not a.is_inline]
+
+    @property
     def pdf_attachments(self) -> list[Attachment]:
-        return [a for a in self.attachments if a.is_pdf]
+        return [a for a in self.attachments if a.is_pdf and not a.is_inline]
 
 
 def parse_addresses(addr_list: Optional[list[dict]]) -> list[EmailAddress]:
@@ -165,6 +184,8 @@ def parse_attachments(att_list: Optional[list[dict]]) -> list[Attachment]:
             media_type=a.get("type") or "application/octet-stream",
             size=a.get("size") or 0,
             blob_id=a["blobId"],
+            cid=a.get("cid"),
+            disposition=a.get("disposition"),
         )
         for a in att_list
     ]
@@ -414,6 +435,59 @@ def download_pdf_attachments(
             pdf_blobs[blob_id] = data
 
     return pdf_blobs
+
+
+def download_inline_images(
+    session: JmapSession,
+    emails: list[Email],
+) -> dict[str, str]:
+    """Download inline image attachments. Returns mapping cid -> data URI."""
+    # Collect unique inline images by cid
+    unique_inlines: dict[str, Attachment] = {}
+    for email in emails:
+        for att in email.inline_attachments:
+            if att.is_image and att.cid not in unique_inlines:
+                unique_inlines[att.cid] = att
+
+    if not unique_inlines:
+        return {}
+
+    total = len(unique_inlines)
+    click.echo(f"Downloading {total} inline image(s)...")
+
+    cid_to_data_uri: dict[str, str] = {}
+    lock = threading.Lock()
+    downloaded_count = 0
+
+    def download_one(cid: str, att: Attachment) -> tuple[str, str]:
+        nonlocal downloaded_count
+        data = download_blob(session, att.blob_id, att.name)
+        b64 = base64.b64encode(data).decode("ascii")
+        data_uri = f"data:{att.media_type};base64,{b64}"
+        with lock:
+            downloaded_count += 1
+            click.echo(f"  Downloaded inline {downloaded_count}/{total}: {att.name}")
+        return cid, data_uri
+
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        futures = [
+            pool.submit(download_one, cid, att)
+            for cid, att in unique_inlines.items()
+        ]
+        for future in as_completed(futures):
+            cid, data_uri = future.result()
+            cid_to_data_uri[cid] = data_uri
+
+    return cid_to_data_uri
+
+
+def resolve_inline_images(html: str, cid_map: dict[str, str]) -> str:
+    """Replace cid: references in HTML with data URIs."""
+    if not cid_map:
+        return html
+    for cid, data_uri in cid_map.items():
+        html = html.replace(f"cid:{cid}", data_uri)
+    return html
 
 
 def save_source_emails(session: JmapSession, emails: list[Email], output_dir: str) -> None:
@@ -722,7 +796,11 @@ def clip_deep_blockquotes(html: str, max_depth: Optional[int] = DEFAULT_QUOTE_LI
     return "".join(result)
 
 
-def render_email_html(email: Email, quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> str:
+def render_email_html(
+    email: Email,
+    quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
+    cid_map: Optional[dict[str, str]] = None,
+) -> str:
     cc_line = ""
     if email.cc_addresses:
         cc_line = f'<div class="email-field"><span class="label">Cc:</span> {escape_html(email.cc_str)}</div>'
@@ -731,10 +809,11 @@ def render_email_html(email: Email, quote_limit: Optional[int] = DEFAULT_QUOTE_L
     if email.bcc_addresses:
         bcc_line = f'<div class="email-field"><span class="label">Bcc:</span> {escape_html(email.bcc_str)}</div>'
 
+    visible_attachments = email.non_inline_attachments
     attachments_line = ""
-    if email.attachments:
+    if visible_attachments:
         items = []
-        for att in email.attachments:
+        for att in visible_attachments:
             css_class = "attachment-item pdf" if att.is_pdf else "attachment-item"
             label = f"{escape_html(att.name)} [{escape_html(att.media_type)}] ({format_size(att.size)})"
             items.append(f'<span class="{css_class}">{label}</span>')
@@ -744,7 +823,10 @@ def render_email_html(email: Email, quote_limit: Optional[int] = DEFAULT_QUOTE_L
         )
 
     if email.html_body.strip():
-        body = clip_deep_blockquotes(sanitize_html_body(email.html_body), quote_limit)
+        html = sanitize_html_body(email.html_body)
+        if cid_map:
+            html = resolve_inline_images(html, cid_map)
+        body = clip_deep_blockquotes(html, quote_limit)
     elif email.text_body.strip():
         body = f'<div class="text-body">{text_to_quoted_html(email.text_body, quote_limit)}</div>'
     else:
@@ -771,11 +853,16 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
-def render_emails_to_pdf_bytes(emails_sorted: list[Email], title: str, quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> bytes:
+def render_emails_to_pdf_bytes(
+    emails_sorted: list[Email],
+    title: str,
+    quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
+    cid_map: Optional[dict[str, str]] = None,
+) -> bytes:
     """Render a list of emails to PDF bytes (without attachment merging)."""
     from weasyprint import HTML
 
-    content = "\n".join(render_email_html(e, quote_limit) for e in emails_sorted)
+    content = "\n".join(render_email_html(e, quote_limit, cid_map) for e in emails_sorted)
     full_html = PAGE_HTML_TEMPLATE.format(title=escape_html(title), content=content)
     return HTML(string=full_html).write_pdf()
 
@@ -956,11 +1043,17 @@ def apply_overlays(
     return output.getvalue()
 
 
-def render_single_pdf(emails: list[Email], output_path: str, pdf_blobs: dict[str, bytes], quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> None:
+def render_single_pdf(
+    emails: list[Email],
+    output_path: str,
+    pdf_blobs: dict[str, bytes],
+    quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
+    cid_map: Optional[dict[str, str]] = None,
+) -> None:
     emails_sorted = sorted(emails, key=lambda e: e.sent_at)
     title = f"Email Archive \u2014 {len(emails)} messages"
 
-    base_pdf = render_emails_to_pdf_bytes(emails_sorted, title, quote_limit)
+    base_pdf = render_emails_to_pdf_bytes(emails_sorted, title, quote_limit, cid_map)
     merged_pdf, page_metas = merge_pdfs(base_pdf, emails_sorted, pdf_blobs)
     final_pdf = apply_overlays(merged_pdf, page_metas, title, "archive")
 
@@ -977,13 +1070,14 @@ def _render_one_thread(
     pdf_blobs: dict[str, bytes],
     output_dir: str,
     quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
+    cid_map: Optional[dict[str, str]] = None,
 ) -> str:
     """Render a single thread to a PDF file. Returns the output filepath."""
     thread_emails.sort(key=lambda e: e.sent_at)
     first = thread_emails[0]
 
     title = f"Thread: {first.subject} ({len(thread_emails)} messages)"
-    base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit)
+    base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit, cid_map)
     merged_pdf, page_metas = merge_pdfs(base_pdf, thread_emails, pdf_blobs)
     final_pdf = apply_overlays(merged_pdf, page_metas, first.subject, first.thread_id)
 
@@ -1043,7 +1137,13 @@ def prepare_output_dir(output_dir: str) -> None:
         click.echo(f"Cleaned {removed} existing file(s) from {output_dir}")
 
 
-def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict[str, bytes], quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT) -> None:
+def render_per_thread_pdfs(
+    emails: list[Email],
+    output_dir: str,
+    pdf_blobs: dict[str, bytes],
+    quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
+    cid_map: Optional[dict[str, str]] = None,
+) -> None:
     prepare_output_dir(output_dir)
 
     threads: dict[str, list[Email]] = {}
@@ -1056,7 +1156,7 @@ def render_per_thread_pdfs(emails: list[Email], output_dir: str, pdf_blobs: dict
 
     def render_and_report(thread_emails: list[Email]) -> str:
         nonlocal rendered_count
-        filepath = _render_one_thread(thread_emails, pdf_blobs, output_dir, quote_limit)
+        filepath = _render_one_thread(thread_emails, pdf_blobs, output_dir, quote_limit, cid_map)
         with lock:
             rendered_count += 1
             click.echo(f"  Written ({rendered_count}/{total}): {filepath}")
@@ -1192,15 +1292,16 @@ def main(
     click.echo(f"Fetched {len(emails)} emails.")
 
     pdf_blobs = download_pdf_attachments(session, emails)
+    cid_map = download_inline_images(session, emails)
 
     click.echo("Rendering PDFs...")
     if single_file:
         if not output.endswith(".pdf"):
             output = output + ".pdf"
-        render_single_pdf(emails, output, pdf_blobs, parsed_quote_limit)
+        render_single_pdf(emails, output, pdf_blobs, parsed_quote_limit, cid_map)
         source_base = os.path.dirname(os.path.abspath(output))
     else:
-        render_per_thread_pdfs(emails, output, pdf_blobs, parsed_quote_limit)
+        render_per_thread_pdfs(emails, output, pdf_blobs, parsed_quote_limit, cid_map)
         source_base = output
 
     save_source_emails(session, emails, source_base)

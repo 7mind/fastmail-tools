@@ -528,11 +528,23 @@ PAGE_HTML_TEMPLATE = """\
   .email-body {{
     padding: 0.5em;
   }}
+  .email-body p {{
+    margin-top: 0.2em !important;
+    margin-bottom: 0.2em !important;
+  }}
+  .email-body td {{
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+  }}
+  .email-body tr {{
+    line-height: 1.3;
+  }}
   .email-body img {{
     max-width: 100%;
   }}
   .email-body table {{
     max-width: 100%;
+    border-collapse: collapse;
   }}
   .id-value {{
     font-family: "DejaVu Sans Mono", "Liberation Mono", monospace;

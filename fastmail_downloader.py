@@ -9,6 +9,7 @@ PDF attachments are downloaded and appended to the rendered output.
 import base64
 import io
 import json
+import logging
 import os
 import re
 import sys
@@ -516,7 +517,12 @@ def download_inline_images(
     session: JmapSession,
     emails: list[Email],
 ) -> dict[str, str]:
-    """Download inline image attachments. Returns mapping cid -> data URI."""
+    """Download inline image attachments. Returns mapping cid -> local file path.
+
+    Uses the blob cache, so images are only fetched once from the network.
+    WeasyPrint loads images directly from these file paths, avoiding
+    base64 encoding and HTML bloat.
+    """
     # Collect unique inline images by cid
     unique_inlines: dict[str, Attachment] = {}
     for email in emails:
@@ -530,19 +536,19 @@ def download_inline_images(
     total = len(unique_inlines)
     click.echo(f"Downloading {total} inline image(s)...")
 
-    cid_to_data_uri: dict[str, str] = {}
+    cid_to_path: dict[str, str] = {}
     lock = threading.Lock()
     downloaded_count = 0
 
     def download_one(cid: str, att: Attachment) -> tuple[str, str]:
         nonlocal downloaded_count
-        data = download_blob(session, att.blob_id, att.name)
-        b64 = base64.b64encode(data).decode("ascii")
-        data_uri = f"data:{att.media_type};base64,{b64}"
+        # download_blob handles caching — returns bytes but we only need the path
+        download_blob(session, att.blob_id, att.name)
+        path = os.path.abspath(_cache_path(att.blob_id))
         with lock:
             downloaded_count += 1
             click.echo(f"  Downloaded inline {downloaded_count}/{total}: {att.name}")
-        return cid, data_uri
+        return cid, path
 
     with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
         futures = [
@@ -550,18 +556,18 @@ def download_inline_images(
             for cid, att in unique_inlines.items()
         ]
         for future in as_completed(futures):
-            cid, data_uri = future.result()
-            cid_to_data_uri[cid] = data_uri
+            cid, path = future.result()
+            cid_to_path[cid] = path
 
-    return cid_to_data_uri
+    return cid_to_path
 
 
 def resolve_inline_images(html: str, cid_map: dict[str, str]) -> str:
-    """Replace cid: references in HTML with data URIs."""
+    """Replace cid: references in HTML with local file paths."""
     if not cid_map:
         return html
-    for cid, data_uri in cid_map.items():
-        html = html.replace(f"cid:{cid}", data_uri)
+    for cid, file_path in cid_map.items():
+        html = html.replace(f"cid:{cid}", f"file://{file_path}")
     return html
 
 
@@ -689,7 +695,11 @@ PAGE_HTML_TEMPLATE = """\
     line-height: 1.3;
   }}
   .email-body img {{
-    max-width: 100%;
+    max-width: 100% !important;
+    max-height: 700pt !important;
+    width: auto !important;
+    height: auto !important;
+    object-fit: contain;
   }}
   .email-body table {{
     max-width: 100%;
@@ -981,7 +991,22 @@ def merge_pdfs(
             if not blob:
                 continue
             try:
-                att_reader = PdfReader(io.BytesIO(blob))
+                # Intercept pypdf warnings to add attachment context
+                pypdf_logger = logging.getLogger("pypdf")
+                old_level = pypdf_logger.level
+                class _ContextFilter(logging.Filter):
+                    def filter(self, record: logging.LogRecord) -> bool:
+                        record.msg = (
+                            f"[attachment '{att.name}' from '{email.subject}']: "
+                            f"{record.msg}"
+                        )
+                        return True
+                ctx_filter = _ContextFilter()
+                pypdf_logger.addFilter(ctx_filter)
+                try:
+                    att_reader = PdfReader(io.BytesIO(blob))
+                finally:
+                    pypdf_logger.removeFilter(ctx_filter)
                 for page in att_reader.pages:
                     box = page.mediabox
                     src_w = float(box.width)

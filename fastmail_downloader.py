@@ -765,7 +765,7 @@ PAGE_HTML_TEMPLATE = """\
 </style>
 </head>
 <body>
-<h1>{title}</h1>
+{title}
 {content}
 </body>
 </html>
@@ -959,17 +959,21 @@ def sanitize_filename(name: str) -> str:
     return name[:200] if name else "untitled"
 
 
-def render_emails_to_pdf_bytes(
-    emails_sorted: list[Email],
-    title: str,
+def render_email_to_pdf_bytes(
+    email: Email,
+    title: Optional[str],
     quote_limit: Optional[int] = DEFAULT_QUOTE_LIMIT,
     cid_map: Optional[dict[str, str]] = None,
 ) -> bytes:
-    """Render a list of emails to PDF bytes (without attachment merging)."""
+    """Render a single email to PDF bytes (without attachment merging).
+
+    If title is None, the <h1> heading is omitted (used for non-first emails in a thread).
+    """
     from weasyprint import HTML
 
-    content = "\n".join(render_email_html(e, quote_limit, cid_map) for e in emails_sorted)
-    full_html = PAGE_HTML_TEMPLATE.format(title=escape_html(title), content=content)
+    content = render_email_html(email, quote_limit, cid_map)
+    title_html = f"<h1>{escape_html(title)}</h1>" if title else ""
+    full_html = PAGE_HTML_TEMPLATE.format(title=title_html, content=content)
     return HTML(string=full_html).write_pdf()
 
 
@@ -981,12 +985,12 @@ class PageMeta:
 
 
 def merge_pdfs(
-    base_pdf_bytes: bytes,
-    emails: list[Email],
+    per_email_pdfs: list[tuple[Email, bytes]],
     pdf_blobs: dict[str, bytes],
 ) -> tuple[bytes, list[PageMeta]]:
-    """Merge the rendered email PDF with any PDF attachments.
+    """Merge per-email PDFs with their PDF attachments, interleaved.
 
+    Each email's rendered pages are followed immediately by its PDF attachments.
     Returns the merged PDF bytes and per-page metadata.
     """
     from pypdf import PdfReader, PdfWriter, Transformation
@@ -999,14 +1003,14 @@ def merge_pdfs(
     writer = PdfWriter()
     page_metas: list[PageMeta] = []
 
-    # Add all pages from the rendered email PDF
-    base_reader = PdfReader(io.BytesIO(base_pdf_bytes))
-    for page in base_reader.pages:
-        writer.add_page(page)
-        page_metas.append(PageMeta(attachment=None, email_subject=None))
+    for email, email_pdf_bytes in per_email_pdfs:
+        # Add this email's rendered pages
+        email_reader = PdfReader(io.BytesIO(email_pdf_bytes))
+        for page in email_reader.pages:
+            writer.add_page(page)
+            page_metas.append(PageMeta(attachment=None, email_subject=None))
 
-    # Append PDF attachments at the end, grouped by email
-    for email in emails:
+        # Immediately follow with this email's PDF attachments
         for att in email.pdf_attachments:
             blob = pdf_blobs.get(att.blob_id)
             if not blob:
@@ -1159,8 +1163,11 @@ def render_single_pdf(
     emails_sorted = sorted(emails, key=lambda e: e.sent_at)
     title = f"Email Archive \u2014 {len(emails)} messages"
 
-    base_pdf = render_emails_to_pdf_bytes(emails_sorted, title, quote_limit, cid_map)
-    merged_pdf, page_metas = merge_pdfs(base_pdf, emails_sorted, pdf_blobs)
+    per_email_pdfs = [
+        (email, render_email_to_pdf_bytes(email, title if i == 0 else None, quote_limit, cid_map))
+        for i, email in enumerate(emails_sorted)
+    ]
+    merged_pdf, page_metas = merge_pdfs(per_email_pdfs, pdf_blobs)
     final_pdf = apply_overlays(merged_pdf, page_metas, title, "archive")
 
     with open(output_path, "wb") as f:
@@ -1185,8 +1192,11 @@ def _render_one_thread(
     title = f"Thread: {first.subject} ({len(thread_emails)} messages)"
 
     with pypdf_log_context(f"thread '{first.subject}'"):
-        base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit, cid_map)
-        merged_pdf, page_metas = merge_pdfs(base_pdf, thread_emails, pdf_blobs)
+        per_email_pdfs = [
+            (email, render_email_to_pdf_bytes(email, title if i == 0 else None, quote_limit, cid_map))
+            for i, email in enumerate(thread_emails)
+        ]
+        merged_pdf, page_metas = merge_pdfs(per_email_pdfs, pdf_blobs)
         final_pdf = apply_overlays(merged_pdf, page_metas, first.subject, first.thread_id)
 
     date_prefix = first.sent_at.strftime("%Y%m%d")

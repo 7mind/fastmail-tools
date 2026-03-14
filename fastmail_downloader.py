@@ -15,13 +15,34 @@ import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Generator, Optional
 
 import click
 import requests
 from dateutil.parser import isoparse
+
+
+# --- Logging ---
+
+@contextmanager
+def pypdf_log_context(label: str) -> Generator[None, None, None]:
+    """Add context label to all pypdf log messages within scope."""
+    pypdf_logger = logging.getLogger("pypdf._reader")
+
+    class _ContextFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            record.msg = f"[{label}]: {record.msg}"
+            return True
+
+    ctx_filter = _ContextFilter()
+    pypdf_logger.addFilter(ctx_filter)
+    try:
+        yield
+    finally:
+        pypdf_logger.removeFilter(ctx_filter)
 
 
 # --- JMAP Client ---
@@ -990,17 +1011,6 @@ def merge_pdfs(
             blob = pdf_blobs.get(att.blob_id)
             if not blob:
                 continue
-            # Intercept pypdf warnings to add attachment context
-            pypdf_logger = logging.getLogger("pypdf")
-            class _ContextFilter(logging.Filter):
-                def filter(self, record: logging.LogRecord) -> bool:
-                    record.msg = (
-                        f"[attachment '{att.name}' from '{email.subject}']: "
-                        f"{record.msg}"
-                    )
-                    return True
-            ctx_filter = _ContextFilter()
-            pypdf_logger.addFilter(ctx_filter)
             try:
                 att_reader = PdfReader(io.BytesIO(blob))
                 for page in att_reader.pages:
@@ -1027,8 +1037,6 @@ def merge_pdfs(
             except Exception as exc:
                 click.echo(f"  Warning: could not read PDF attachment '{att.name}' "
                            f"from email '{email.subject}': {exc}", err=True)
-            finally:
-                pypdf_logger.removeFilter(ctx_filter)
 
     output = io.BytesIO()
     writer.write(output)
@@ -1175,9 +1183,11 @@ def _render_one_thread(
     first = thread_emails[0]
 
     title = f"Thread: {first.subject} ({len(thread_emails)} messages)"
-    base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit, cid_map)
-    merged_pdf, page_metas = merge_pdfs(base_pdf, thread_emails, pdf_blobs)
-    final_pdf = apply_overlays(merged_pdf, page_metas, first.subject, first.thread_id)
+
+    with pypdf_log_context(f"thread '{first.subject}'"):
+        base_pdf = render_emails_to_pdf_bytes(thread_emails, title, quote_limit, cid_map)
+        merged_pdf, page_metas = merge_pdfs(base_pdf, thread_emails, pdf_blobs)
+        final_pdf = apply_overlays(merged_pdf, page_metas, first.subject, first.thread_id)
 
     date_prefix = first.sent_at.strftime("%Y%m%d")
     filename = f"{date_prefix}_{sanitize_filename(first.subject)}.pdf"
@@ -1308,6 +1318,11 @@ def render_per_thread_pdfs(
     help="Comma-separated substrings to match in Cc field.",
 )
 @click.option(
+    "--filters",
+    default="",
+    help="Comma-separated substrings to match in From, To, and Cc fields (shorthand for setting all three lists).",
+)
+@click.option(
     "--single-file",
     is_flag=True,
     default=False,
@@ -1336,6 +1351,7 @@ def main(
     from_list: str,
     to_list: str,
     cc_list: str,
+    filters: str,
     single_file: bool,
     file_per_chain: bool,
     output: str,
@@ -1356,12 +1372,13 @@ def main(
         "Specify only one output mode: --single-file or --file-per-chain"
     )
 
-    from_substrings = [s.strip() for s in from_list.split(",") if s.strip()]
-    to_substrings = [s.strip() for s in to_list.split(",") if s.strip()]
-    cc_substrings = [s.strip() for s in cc_list.split(",") if s.strip()]
+    filter_substrings = [s.strip() for s in filters.split(",") if s.strip()]
+    from_substrings = [s.strip() for s in from_list.split(",") if s.strip()] or filter_substrings
+    to_substrings = [s.strip() for s in to_list.split(",") if s.strip()] or filter_substrings
+    cc_substrings = [s.strip() for s in cc_list.split(",") if s.strip()] or filter_substrings
 
     assert from_substrings or to_substrings or cc_substrings, (
-        "At least one of --from-list, --to-list, or --cc-list must be specified"
+        "At least one of --filters, --from-list, --to-list, or --cc-list must be specified"
     )
 
     if range_start and range_start.tzinfo is None:

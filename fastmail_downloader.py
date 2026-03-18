@@ -18,7 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Generator, Optional
+from typing import Any, Generator, Optional
 
 import click
 import requests
@@ -772,6 +772,277 @@ PAGE_HTML_TEMPLATE = """\
 """
 
 
+def _has_border_top_solid(style: str) -> bool:
+    """Check if a CSS style string contains a solid border-top declaration.
+
+    Handles both shorthand (border-top:solid #E1E1E1 1.0pt) and longhand
+    (border-top-style:solid) variants used by different Outlook/Windows Mail versions.
+    """
+    normalized = style.lower().replace(" ", "")
+    return "border-top:solid" in normalized or "border-top-style:solid" in normalized
+
+
+# Outlook localizes the From/Sent/To/Subject header labels.
+# These cover English, German, French, Spanish, Italian, Dutch, Swedish,
+# Portuguese, and Russian.
+_OUTLOOK_FROM_LABELS = re.compile(
+    r"(From|Von|De|Da|Van|Från|От кого)\s*:", re.IGNORECASE
+)
+_OUTLOOK_SENT_LABELS = re.compile(
+    r"(Sent|Date|Gesendet|Envoyé|Enviado|Inviato|Verzonden|Skickat|Дата)\s*:", re.IGNORECASE
+)
+
+
+def _is_outlook_border_separator(element: Any) -> bool:
+    """Check if an element is an Outlook-style quote separator (border-top pattern).
+
+    Outlook Desktop (2007+) uses a <div> wrapping a child <div> with border-top:solid
+    style, containing localized From/Sent/To/Subject header text.
+    """
+    if element.tag != "div":
+        return False
+    for child in element:
+        if child.tag == "div":
+            style = child.get("style") or ""
+            if _has_border_top_solid(style):
+                text_content = child.text_content().strip()
+                if _OUTLOOK_FROM_LABELS.search(text_content) and _OUTLOOK_SENT_LABELS.search(text_content):
+                    return True
+    return False
+
+
+def _is_outlook_owa_separator(element: Any) -> bool:
+    """Check if an element is an OWA/older Outlook separator (divRplyFwdMsg pattern).
+
+    Outlook Web App and some older versions use <div id="divRplyFwdMsg"> after an <hr>.
+    """
+    if element.tag != "div":
+        return False
+    return (element.get("id") or "").lower() == "divrplyfwdmsg"
+
+
+def _is_outlook_mac_separator(element: Any) -> bool:
+    """Check if an element is an Outlook Mac separator (#OLK_SRC_BODY_SECTION).
+
+    Outlook for Mac wraps the original message body in a <div> or <span>
+    with id="OLK_SRC_BODY_SECTION".
+    """
+    if element.tag not in ("div", "span"):
+        return False
+    return (element.get("id") or "") == "OLK_SRC_BODY_SECTION"
+
+
+def _is_outlook_2003_separator(element: Any) -> bool:
+    """Check if an element is an Outlook 2003 separator.
+
+    Outlook 2003 uses: div > div.MsoNormal[align=center] > font > span > hr[size=3][width=100%]
+    We look for a div containing a centered div.MsoNormal with an <hr> descendant.
+    """
+    if element.tag != "div":
+        return False
+    for child in element:
+        if child.tag != "div":
+            continue
+        classes = (child.get("class") or "").split()
+        if "MsoNormal" not in classes:
+            continue
+        if (child.get("align") or "").lower() != "center":
+            continue
+        # Check for an <hr> descendant with size="3" or width="100%"
+        for hr in child.iter("hr"):
+            size = hr.get("size") or ""
+            width = hr.get("width") or ""
+            if size == "3" or width == "100%":
+                return True
+    return False
+
+
+# Generic "From:" block detection — elements whose visible text starts with "From:"
+# followed by a "Date:"/"Sent:" line, typical of plain forwarded headers.
+_GENERIC_FROM_DATE_BLOCK = re.compile(
+    r"^-*\s*(From|Von|De|Da|Van|Från|От кого)\s*:.*"
+    r"(Sent|Date|Gesendet|Envoyé|Enviado|Inviato|Verzonden|Skickat|Дата)\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_generic_from_block(element: Any) -> bool:
+    """Check if an element is a generic From/Date forwarded-header block.
+
+    Some clients insert plain-text forwarding headers like:
+    From: sender@example.com
+    Sent: 18 March 2026
+    ...
+    These are detected by checking the first ~300 chars of text_content.
+    """
+    if element.tag != "div":
+        return False
+    text = element.text_content().strip()[:300]
+    return bool(_GENERIC_FROM_DATE_BLOCK.match(text))
+
+
+def _is_quote_separator(element: Any) -> bool:
+    """Check if an element marks the start of a quoted reply.
+
+    Detects patterns from:
+    - Outlook Desktop (border-top div with From/Sent headers)
+    - Outlook Web App (divRplyFwdMsg)
+    - Outlook 2003 (MsoNormal + centered hr)
+    - Outlook Mac (OLK_SRC_BODY_SECTION)
+    - Gmail (div class=gmail_quote)
+    - Generic From/Date header blocks
+    """
+    if element.tag not in ("div", "span"):
+        return False
+    # Outlook Desktop: wrapper div containing a child div with border-top
+    if _is_outlook_border_separator(element):
+        return True
+    # OWA: <div id="divRplyFwdMsg">
+    if _is_outlook_owa_separator(element):
+        return True
+    # Outlook Mac: <div/span id="OLK_SRC_BODY_SECTION">
+    if _is_outlook_mac_separator(element):
+        return True
+    # Outlook 2003: div > div.MsoNormal[align=center] > ... > hr
+    if _is_outlook_2003_separator(element):
+        return True
+    # Gmail: <div class="gmail_quote">
+    classes = (element.get("class") or "").split()
+    if "gmail_quote" in classes:
+        return True
+    # Generic From/Date block
+    if _is_generic_from_block(element):
+        return True
+    return False
+
+
+def _wrap_siblings_in_blockquote(
+    element: Any,
+    parent: Any,
+    lxml_html: Any,
+) -> None:
+    """Wrap element and all following siblings in a <blockquote>."""
+    siblings = list(parent)
+    idx = siblings.index(element)
+    to_wrap = siblings[idx:]
+
+    bq = lxml_html.HtmlElement()
+    bq.tag = "blockquote"
+
+    # Preserve tail text (text between the previous sibling and this element)
+    bq.tail = element.tail
+    element.tail = None
+
+    for sib in to_wrap:
+        parent.remove(sib)
+        bq.append(sib)
+
+    parent.append(bq)
+
+
+def _is_zimbra_separator(element: Any) -> bool:
+    """Check if an element is a Zimbra quote separator.
+
+    Zimbra uses <hr data-marker="__DIVIDER__"> or <hr id="zwchr"> to separate quotes.
+    """
+    if element.tag != "hr":
+        return False
+    if element.get("data-marker") == "__DIVIDER__":
+        return True
+    if (element.get("id") or "") == "zwchr":
+        return True
+    return False
+
+
+def convert_outlook_quotes(html: str) -> str:
+    """Convert non-blockquote quoted replies into <blockquote> elements.
+
+    Detects and wraps quoted content from:
+    - Outlook Desktop (div with border-top + From/Sent headers)
+    - Outlook Web App (divRplyFwdMsg)
+    - Outlook 2003 (MsoNormal + centered hr)
+    - Outlook Mac (OLK_SRC_BODY_SECTION)
+    - Gmail (div.gmail_quote)
+    - Zimbra (hr[data-marker="__DIVIDER__"] / hr#zwchr)
+    - Generic From/Date header blocks
+
+    The separator element and all subsequent siblings are wrapped in a <blockquote>.
+    """
+    from lxml import html as lxml_html
+    from lxml.etree import tostring as lxml_tostring
+
+    try:
+        doc = lxml_html.fragment_fromstring(html, create_parent="div")
+    except Exception:
+        return html
+
+    processed: set[int] = set()
+    changed = True
+    while changed:
+        changed = False
+        # Check div/span separators
+        for element in doc.iter("div", "span"):
+            if id(element) in processed:
+                continue
+            if not _is_quote_separator(element):
+                continue
+            parent = element.getparent()
+            if parent is None:
+                continue
+            # Don't wrap if any ancestor is already a blockquote
+            ancestor = parent
+            inside_bq = False
+            while ancestor is not None:
+                if ancestor.tag == "blockquote":
+                    inside_bq = True
+                    break
+                ancestor = ancestor.getparent()
+            if inside_bq:
+                processed.add(id(element))
+                continue
+
+            processed.add(id(element))
+            _wrap_siblings_in_blockquote(element, parent, lxml_html)
+            changed = True
+            break
+        if changed:
+            continue
+        # Check Zimbra <hr> separators
+        for element in doc.iter("hr"):
+            if id(element) in processed:
+                continue
+            if not _is_zimbra_separator(element):
+                continue
+            parent = element.getparent()
+            if parent is None:
+                continue
+            ancestor = parent
+            inside_bq = False
+            while ancestor is not None:
+                if ancestor.tag == "blockquote":
+                    inside_bq = True
+                    break
+                ancestor = ancestor.getparent()
+            if inside_bq:
+                processed.add(id(element))
+                continue
+
+            processed.add(id(element))
+            _wrap_siblings_in_blockquote(element, parent, lxml_html)
+            changed = True
+            break
+
+    # Serialize back to string
+    result_parts: list[str] = []
+    if doc.text:
+        result_parts.append(doc.text)
+    for child in doc:
+        result_parts.append(
+            lxml_tostring(child, encoding="unicode", method="html")
+        )
+    return "".join(result_parts)
+
+
 def sanitize_html_body(html: str) -> str:
     """Strip <html>, <head>, <body> wrappers and trailing whitespace from email HTML."""
     html = re.sub(r"<\s*!DOCTYPE[^>]*>", "", html, flags=re.IGNORECASE)
@@ -930,6 +1201,7 @@ def render_email_html(
 
     if email.html_body.strip():
         html = sanitize_html_body(email.html_body)
+        html = convert_outlook_quotes(html)
         if cid_map:
             html = resolve_inline_images(html, cid_map)
         body = clip_deep_blockquotes(html, quote_limit)

@@ -25,6 +25,7 @@
             pythonPkgs.python-dateutil
             pythonPkgs.pypdf
             pythonPkgs.cryptography
+            pythonPkgs.lxml
           ];
         };
       });

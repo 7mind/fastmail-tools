@@ -1447,8 +1447,6 @@ def render_single_pdf(
     click.echo(f"Written: {output_path}")
 
 
-RENDER_WORKERS = os.cpu_count() or 4
-
 
 def _render_one_thread(
     thread_emails: list[Email],
@@ -1540,25 +1538,13 @@ def render_per_thread_pdfs(
     for email in emails:
         threads.setdefault(email.thread_id, []).append(email)
 
-    lock = threading.Lock()
-    rendered_count = 0
     total = len(threads)
 
-    def render_and_report(thread_emails: list[Email]) -> str:
-        nonlocal rendered_count
+    # Render sequentially — WeasyPrint/lxml use C libraries (Cairo, Pango, libxml2)
+    # that are not thread-safe and cause heap corruption under ThreadPoolExecutor.
+    for i, thread_emails in enumerate(threads.values(), 1):
         filepath = _render_one_thread(thread_emails, pdf_blobs, output_dir, quote_limit, cid_map)
-        with lock:
-            rendered_count += 1
-            click.echo(f"  Written ({rendered_count}/{total}): {filepath}")
-        return filepath
-
-    with ThreadPoolExecutor(max_workers=RENDER_WORKERS) as pool:
-        futures = [
-            pool.submit(render_and_report, thread_emails)
-            for thread_emails in threads.values()
-        ]
-        for future in as_completed(futures):
-            future.result()
+        click.echo(f"  Written ({i}/{total}): {filepath}")
 
     click.echo(f"Created {total} thread PDFs in {output_dir}")
 
